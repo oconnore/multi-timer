@@ -69,25 +69,26 @@
 	  (cvl (timer-cv-lock tm)))
       (with-lock-held (cvl)
 	(incf (timer-cv-wait tm))
-	(condition-wait cv cvl)))))
+	(when (plusp (timer-cv-wait tm))
+	  (condition-wait cv cvl))))))
 
 ;;; ----------------------------------------------------------------------------
 
 (defun timer-notify (&optional (tm *timer*))
   (when tm
     (let ((cv (timer-cv tm))
-	  (cvl (timer-cv-lock tm))
-	  (cvw (timer-cv-wait tm)))
+	  (cvl (timer-cv-lock tm)))
       (with-lock-held (cvl)
-	(when (plusp cvw)
-	  (unwind-protect
-	       (decf (timer-cv-wait tm))
+	(unwind-protect
+	     (decf (timer-cv-wait tm))
+	  (unless (minusp (timer-cv-wait tm))
 	    (condition-notify cv)))))))
 
 ;;;
 ;;; Timer definitions
 ;;;
 (defun timer-handling ()
+  (declare (optimize (debug 3)))
   (flet ((maybe-invoke-event (event)
 	   (when (< (timer-event-time event)
 		    (get-internal-real-time))
@@ -130,14 +131,15 @@
 (defun ensure-timer-thread (&optional force)
   (when (or force (not *timer*))
     (setf *timer*
-	  (make-timer :thread (make-thread #'timer-handling)
-		      :cv-lock (make-lock)
-		      :cv (make-condition-variable)
-		      :cv-wait 0
-		      :queue (make-queue :type 'priority-cqueue
-					 :compare (lambda (x y)
-						    (< (timer-event-time x)
-						       (timer-event-time y))))))
+	  (make-timer 
+	   :cv-lock (make-lock)
+	   :cv (make-condition-variable)
+	   :cv-wait 0
+	   :queue (make-queue :type 'priority-cqueue
+			      :compare (lambda (x y)
+					 (< (timer-event-time x)
+					    (timer-event-time y)))))
+	  (timer-thread *timer*) (make-thread #'timer-handling))
     ;; Wait for the new thread to initiate
     (timer-wait)
     t))
@@ -185,7 +187,8 @@
 ;;; ----------------------------------------------------------------------------
 
 (defun clear-timers ()
-  (when (and *timer* (timer-thread *timer*))
+  (when (and *timer* (timer-thread *timer*)
+	     (thread-alive-p (timer-thread *timer*)))
     (destroy-thread (timer-thread *timer*)))
   (ensure-timer-thread t))
 
