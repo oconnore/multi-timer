@@ -87,6 +87,7 @@
 ;;;
 ;;; Timer definitions
 ;;;
+
 (defun timer-handling ()
   (declare (optimize (debug 3)))
   (flet ((maybe-invoke-event (event)
@@ -114,14 +115,12 @@
 					 (get-internal-real-time))
 				  (let ((*in-scope?* t))
 				    (declare (ignorable *in-scope?*))
-				    ;; Sleep here, and allow timer functions
-				    ;; to acquire the lock (and therefore invoke
-				    ;; a timer-interrupt).
+				    ;; Sleep here, and allow interrupts
 				    (let ((secs (i2secs
 						 (- (timer-event-time event)
 						    (get-internal-real-time)))))
 				      (when (plusp secs) (sleep secs))))))
-		      ;; If an interrupt occurred, attempt to invoke the active timer
+		      ;; Attempt to invoke the active timer
 		      (when (and event (maybe-invoke-event event))
 			(qpop (timer-queue *timer*))))))
 		 (t (timer-wait))))))))
@@ -162,6 +161,7 @@
     (qpush (timer-queue *timer*) event)
     (timer-notify)
     (interrupt-thread (timer-thread *timer*) #'%int-thrower)
+    (sleep 0)
     event))
 
 ;;; ----------------------------------------------------------------------------
