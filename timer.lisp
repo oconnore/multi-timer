@@ -150,7 +150,6 @@
 					   (> (timer-event-time event)
 					      (get-internal-real-time)))
 				  (let ((*in-scope?* t))
-				    (declare (ignorable *in-scope?*))
 				    ;; Sleep here, and allow interrupts
 				    (let ((secs (i2secs
 						 (- (timer-event-time event)
