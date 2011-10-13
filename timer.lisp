@@ -19,6 +19,17 @@
 (defvar *timer* nil)
 (defvar *in-scope?* nil)
 
+;;; ---------------------------------------------------------------------------
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (export '(set-timer
+	    remove-timer
+	    map-timers
+	    clear-timers
+	    with-mtimeout
+	    timer-event-p)))
+	    
+
 ;;;
 ;;; Data types
 ;;;
@@ -35,7 +46,7 @@
 	      (qsize (timer-queue o))))))
 
 (defstruct timer-event
-  time thread fn)
+  time thread fn node)
 
 (defmethod print-object ((o timer-event) stream)
   (print-unreadable-object (o stream :type t)
@@ -204,26 +215,19 @@
     (multiple-value-bind (ign node)
 	(qpush (timer-queue *timer*) event)
       (declare (ignore ign))
+      (setf (timer-event-node event) node)
       (cv-notify (timer-empty-cv *timer*))
       (interrupt-thread (timer-thread *timer*) #'%int-thrower)
-      (values event node))))
+      (values event))))
 
 ;;; ----------------------------------------------------------------------------
 
 (defun remove-timer (timer)
   (ensure-timer-thread)
-  (let ((node
-	 (if (queue-node-p timer)
-	     timer
-	     (block search
-	       (queue-find (timer-queue *timer*)
-			   (lambda (x)
-			     (when (eq x timer)
-			       (return-from search
-				 *current-queue-node*))))))))
-    (when node
-      (queue-delete (timer-queue *timer*) node)
-      timer)))
+  (when (and timer (timer-event-p timer)
+	     (timer-event-node timer) (queue-node-p (timer-event-node timer)))
+    (queue-delete (timer-queue *timer*) (timer-event-node timer))
+    timer))
 
 ;;; ----------------------------------------------------------------------------
 
@@ -251,10 +255,9 @@
 	   (unwind-protect
 		(progn
 		  (setf ,node
-			(nth-value 1
-				   (set-timer (lambda ()
-						(throw ',timeout t))
-					      ,time-form)))
+			(set-timer (lambda ()
+				     (throw ',timeout t))
+				   ,time-form))
 		  (return-from ,block
 		    (progn ,@try-forms)))
 	     (when ,node
