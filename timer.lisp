@@ -25,9 +25,7 @@
 
 (defstruct timer
   thread
-  cv-lock
-  cv
-  cv-wait
+  empty-cv fair-cv last-time
   queue)
 
 (defmethod print-object ((o timer) stream)
@@ -61,28 +59,57 @@
   (values (floor (* (coerce x 'double-float)
 		    #.(coerce internal-time-units-per-second 'double-float)))))
 
+;;;
+;;; Condition variables
+;;;
+
+(defstruct cv
+  (lock (make-lock))
+  (var (make-condition-variable))
+  (count 0)
+  (notified 0)
+  (accum nil)
+  (accum-max nil))
+
 ;;; ----------------------------------------------------------------------------
 
-(defun timer-wait (&optional (tm *timer*))
-  (when tm
-    (let ((cv (timer-cv tm))
-	  (cvl (timer-cv-lock tm)))
-      (with-lock-held (cvl)
-	(incf (timer-cv-wait tm))
-	(when (plusp (timer-cv-wait tm))
-	  (condition-wait cv cvl))))))
+(defvar *current-cv* nil
+  "Bound to the current cv during predicate calls in cv-wait and cv-notify")
 
 ;;; ----------------------------------------------------------------------------
 
-(defun timer-notify (&optional (tm *timer*))
-  (when tm
-    (let ((cv (timer-cv tm))
-	  (cvl (timer-cv-lock tm)))
-      (with-lock-held (cvl)
-	(unwind-protect
-	     (decf (timer-cv-wait tm))
-	  (unless (minusp (timer-cv-wait tm))
-	    (condition-notify cv)))))))
+(defun cv-wait (cv &optional predicate)
+  (when cv
+    (let ((lock (cv-lock cv))
+	  (*current-cv* cv))
+      (with-lock-held (lock)
+	(when (if predicate (funcall predicate) t)
+	  (loop
+	     (unless (plusp (cv-notified cv))
+	       (incf (cv-count cv))
+	       (condition-wait (cv-var cv) lock))
+	     (when (plusp (cv-notified cv))
+	       (decf (cv-notified cv))
+	       (return-from cv-wait t))))))))
+
+;;; ----------------------------------------------------------------------------
+
+(defun cv-notify (cv &optional predicate)
+  (when cv
+    (let ((lock (cv-lock cv))
+	  (*current-cv* cv))
+      (with-lock-held (lock)
+	(when (if predicate (funcall predicate) t)
+	  (when (or (plusp (cv-count cv))
+		    (cv-accum cv))
+	    (setf (cv-notified cv)
+		  (if (cv-accum-max cv)
+		      (min (1+ (cv-notified cv))
+			   (cv-accum-max cv))
+		      (1+ (cv-notified cv)))))
+	  (when (plusp (cv-count cv))
+	    (decf (cv-count cv))
+	    (condition-notify (cv-var cv))))))))
 
 ;;;
 ;;; Timer definitions
@@ -99,13 +126,11 @@
 		  (timer-event-fn event))
 		 (make-thread (timer-event-fn event)))
 	     t)))
-    (let ((*in-scope?* nil)
-	  (first t))
+    (let ((*in-scope?* nil))
       (loop
 	 (catch 'interrupt
 	   ;; When constructing a timer thread, the constructor waits on the cv
 	   ;; one time, to give this function time to set up
-	   (when first (timer-notify) (setf first nil))
 	   (cond ((plusp (qsize (timer-queue *timer*)))
 		  (let (event)
 		    (unwind-protect
@@ -119,11 +144,14 @@
 				    (let ((secs (i2secs
 						 (- (timer-event-time event)
 						    (get-internal-real-time)))))
+				      (cv-notify (timer-fair-cv *timer*))
 				      (when (plusp secs) (sleep secs))))))
 		      ;; Attempt to invoke the active timer
 		      (when (and event (maybe-invoke-event event))
 			(qpop (timer-queue *timer*))))))
-		 (t (timer-wait))))))))
+		 (t
+		  (cv-notify (timer-fair-cv *timer*))
+		  (cv-wait (timer-empty-cv *timer*)))))))))
 
 ;;; ----------------------------------------------------------------------------
 
@@ -131,16 +159,17 @@
   (when (or force (not *timer*))
     (setf *timer*
 	  (make-timer 
-	   :cv-lock (make-lock)
-	   :cv (make-condition-variable)
-	   :cv-wait 0
+	   :empty-cv (make-cv)
+	   :fair-cv (make-cv 
+		     :accum t
+		     :accum-max 1
+		     :notified 1)
+	   :last-time 0
 	   :queue (make-queue :type 'priority-cqueue
 			      :compare (lambda (x y)
 					 (< (timer-event-time x)
 					    (timer-event-time y)))))
 	  (timer-thread *timer*) (make-thread #'timer-handling))
-    ;; Wait for the new thread to initiate
-    (timer-wait)
     t))
 
 ;;; ----------------------------------------------------------------------------
@@ -153,27 +182,37 @@
 
 (defun set-timer (fn time &optional new-thread)
   (ensure-timer-thread)
+  (cv-wait (timer-fair-cv *timer*)
+	   (lambda ()
+	     (and (> (get-internal-real-time)
+		     (+ (timer-last-time *timer*)
+			(secs2i .0001)))
+		  (zerop (cv-count *current-cv*)))))
   (let ((event (make-timer-event
 		:fn fn
 		:thread (unless new-thread (current-thread))
 		:time (+ (secs2i time)
 			 (get-internal-real-time)))))
-    (qpush (timer-queue *timer*) event)
-    (timer-notify)
-    (interrupt-thread (timer-thread *timer*) #'%int-thrower)
-    (sleep 0)
-    event))
+    (multiple-value-bind (ign node)
+	(qpush (timer-queue *timer*) event)
+      (declare (ignore ign))
+      (cv-notify (timer-empty-cv *timer*))
+      (interrupt-thread (timer-thread *timer*) #'%int-thrower)
+      (values event node))))
 
 ;;; ----------------------------------------------------------------------------
 
 (defun remove-timer (timer)
   (ensure-timer-thread)
   (let ((node
-	 (block search
-	   (queue-find (timer-queue *timer*)
-		       (lambda (x)
-			 (when (eq x timer)
-			   (return-from search *current-queue-node*)))))))
+	 (if (queue-node-p timer)
+	     timer
+	     (block search
+	       (queue-find (timer-queue *timer*)
+			   (lambda (x)
+			     (when (eq x timer)
+			       (return-from search
+				 *current-queue-node*))))))))
       (when node
 	(queue-delete (timer-queue *timer*) node)
 	timer)))
@@ -194,8 +233,26 @@
 
 ;;; ----------------------------------------------------------------------------
 
-;;(defmacro with-mtimeout ((time-form &rest timeout-forms) try-form)
-;;  (
+(defmacro with-mtimeout ((time-form &rest timeout-forms) &rest try-forms)
+  (let ((block (gensym "multi-timer-block"))
+	(timeout (gensym "multi-timer-timeout"))
+	(node (gensym "multi-timer-node")))
+    `(block ,block
+       (catch ',timeout
+	 (let (,node)
+	   (unwind-protect
+		(progn
+		  (setf ,node
+			(nth-value 1
+				   (set-timer (lambda ()
+						(throw ',timeout t))
+					      ,time-form)))
+		  (return-from ,block
+		    (progn ,@try-forms)))
+	     (when ,node
+	       (remove-timer ,node)))))
+       ,@timeout-forms)))
+      
 
 ;;; ===========================================================================
 ;;; End of file
