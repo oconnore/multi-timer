@@ -116,7 +116,6 @@
 ;;;
 
 (defun timer-handling ()
-  (declare (optimize (debug 3)))
   (flet ((maybe-invoke-event (event)
 	   (when (< (timer-event-time event)
 		    (get-internal-real-time))
@@ -136,21 +135,30 @@
 		    (unwind-protect
 			 (progn (setf event (qtop (timer-queue *timer*) nil))
 				;; We only sleep if the timer is not expired
-				(when (> (timer-event-time event)
-					 (get-internal-real-time))
+				(when (and event (timer-event-p event)
+					   (> (timer-event-time event)
+					      (get-internal-real-time)))
 				  (let ((*in-scope?* t))
 				    (declare (ignorable *in-scope?*))
 				    ;; Sleep here, and allow interrupts
 				    (let ((secs (i2secs
 						 (- (timer-event-time event)
 						    (get-internal-real-time)))))
-				      (cv-notify (timer-fair-cv *timer*))
+				      (cv-notify (timer-fair-cv *timer*)
+						 (lambda ()
+						   (setf (timer-last-time *timer*)
+							 (get-internal-real-time))
+						   t))
 				      (when (plusp secs) (sleep secs))))))
 		      ;; Attempt to invoke the active timer
 		      (when (and event (maybe-invoke-event event))
 			(qpop (timer-queue *timer*))))))
 		 (t
-		  (cv-notify (timer-fair-cv *timer*))
+		  (cv-notify (timer-fair-cv *timer*)
+			     (lambda ()
+			       (setf (timer-last-time *timer*)
+				     (get-internal-real-time))
+			       t))
 		  (cv-wait (timer-empty-cv *timer*)))))))))
 
 ;;; ----------------------------------------------------------------------------
@@ -213,9 +221,9 @@
 			     (when (eq x timer)
 			       (return-from search
 				 *current-queue-node*))))))))
-      (when node
-	(queue-delete (timer-queue *timer*) node)
-	timer)))
+    (when node
+      (queue-delete (timer-queue *timer*) node)
+      timer)))
 
 ;;; ----------------------------------------------------------------------------
 
