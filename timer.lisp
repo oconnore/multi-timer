@@ -247,22 +247,27 @@
 (defmacro with-mtimeout ((time-form &rest timeout-forms) &rest try-forms)
   (let ((block (gensym "multi-timer-block"))
 	(timeout (gensym "multi-timer-timeout"))
-	(node (gensym "multi-timer-node")))
+	(node (gensym "multi-timer-node"))
+	(mutex (gensym "multi-timer-mutex"))
+	(complete (gensym "multi-timer-complete")))
     `(block ,block
        (catch ',timeout
-	 (let (,node)
+	 (let (,node (,mutex (make-lock)) (,complete nil))
 	   (unwind-protect
 		(progn
 		  (setf ,node
 			(set-timer (lambda ()
-				     (throw ',timeout t))
+				     (with-lock-held (,mutex)
+				       (unless ,complete
+					 (throw ',timeout t))))
 				   ,time-form))
 		  (return-from ,block
 		    (progn ,@try-forms)))
 	     (when ,node
-	       (remove-timer ,node)))))
+	       (with-lock-held (,mutex)
+		 (remove-timer ,node)
+		 (setf ,complete t))))))
        ,@timeout-forms)))
-      
 
 ;;; ===========================================================================
 ;;; End of file
